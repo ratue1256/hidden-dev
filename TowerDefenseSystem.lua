@@ -1,13 +1,18 @@
 -- Discord: e_z_1_o | Roblox: ezio25eziopro
+
 local CollectionService = game:GetService("CollectionService")
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
+-- CollectionService tags are used to automatically detect towers and enemies.
+-- Any Model tagged with "Tower" is registered by the tower manager below.
 local TOWER_TAG = "Tower"
 local ENEMY_TAG = "Enemy"
 
+-- These values are used when a tower does not have the corresponding
+-- attribute configured. Individual towers can override them with attributes.
 local DEFAULT_CONFIG = {
 	Range = 45,
 	Damage = 18,
@@ -24,6 +29,8 @@ local DEFAULT_CONFIG = {
 	MaxProjectilePoolSize = 40,
 }
 
+-- All active and pooled projectile visuals are stored in this folder.
+-- Keeping them in one folder makes raycast filtering and cleanup easier.
 local PROJECTILE_FOLDER = Workspace:FindFirstChild("TowerProjectiles")
 
 if not PROJECTILE_FOLDER then
@@ -32,6 +39,8 @@ if not PROJECTILE_FOLDER then
 	PROJECTILE_FOLDER.Parent = Workspace
 end
 
+-- Reads a numeric attribute while guaranteeing that invalid or too-small
+-- values do not break tower behavior.
 local function getNumberAttribute(instance, name, fallback, minimum)
 	local value = instance:GetAttribute(name)
 
@@ -46,6 +55,8 @@ local function getNumberAttribute(instance, name, fallback, minimum)
 	return value
 end
 
+-- Reads a boolean attribute and uses the default value if the attribute
+-- has not been configured correctly.
 local function getBooleanAttribute(instance, name, fallback)
 	local value = instance:GetAttribute(name)
 
@@ -56,6 +67,8 @@ local function getBooleanAttribute(instance, name, fallback)
 	return fallback
 end
 
+-- Reads a string attribute and rejects empty strings because they cannot
+-- represent a valid targeting mode.
 local function getStringAttribute(instance, name, fallback)
 	local value = instance:GetAttribute(name)
 
@@ -66,6 +79,9 @@ local function getStringAttribute(instance, name, fallback)
 	return fallback
 end
 
+-- Attachments and BaseParts expose their position differently.
+-- This helper gives the rest of the script one consistent way to obtain
+-- the world position of a muzzle or another valid object.
 local function getWorldPosition(instance)
 	if instance:IsA("Attachment") then
 		return instance.WorldPosition
@@ -75,9 +91,11 @@ local function getWorldPosition(instance)
 		return instance.Position
 	end
 
-	error(instance:GetFullName() .. " is not a BaseParp or Attachment")
+	error(instance:GetFullName() .. " is not a BasePart or Attachment")
 end
 
+-- This is the CFrame equivalent of getWorldPosition().
+-- It is used when the projectile needs to inherit the muzzle orientation.
 local function getWorldCFrame(instance)
 	if instance:IsA("Attachment") then
 		return instance.WorldCFrame
@@ -90,6 +108,9 @@ local function getWorldCFrame(instance)
 	error(instance:GetFullName() .. " is not a BasePart or Attachment")
 end
 
+-- Finds the first ancestor carrying a specific CollectionService tag.
+-- Raycasts usually hit a body part, not the enemy Model itself, so this
+-- function converts the hit part back into the tagged enemy model.
 local function findTaggedAncestor(instance, tag)
 	local current = instance
 
@@ -104,6 +125,8 @@ local function findTaggedAncestor(instance, tag)
 	return nil
 end
 
+-- Enemies can use different body structures, so the script accepts a
+-- HumanoidRootPart, PrimaryPart, or Head as the tracking point.
 local function getEnemyComponents(enemy)
 	if not enemy or not enemy.Parent then
 		return nil, nil
@@ -121,6 +144,8 @@ local function getEnemyComponents(enemy)
 	return humanoid, root
 end
 
+-- This check is used before selecting, aiming at, or damaging an enemy.
+-- It prevents towers and projectiles from keeping references to dead targets.
 local function isEnemyAlive(enemy)
 	local humanoid, root = getEnemyComponents(enemy)
 
@@ -130,6 +155,9 @@ local function isEnemyAlive(enemy)
 		and humanoid:GetState() ~= Enum.HumanoidStateType.Dead
 end
 
+-- Creates the shared projectile template once.
+-- Every projectile in the pool is cloned from this object instead of
+-- rebuilding lights, attachments, and trails for every shot.
 local function createProjectileTemplate()
 	local existing = ReplicatedStorage:FindFirstChild("TowerProjectileTemplate")
 
@@ -149,6 +177,7 @@ local function createProjectileTemplate()
 	projectile.CanQuery = false
 	projectile.CastShadow = false
 
+	-- The light makes the projectile visible even when it moves quickly.
 	local light = Instance.new("PointLight")
 	light.Name = "ProjectileLight"
 	light.Color = projectile.Color
@@ -156,6 +185,7 @@ local function createProjectileTemplate()
 	light.Range = 7
 	light.Parent = projectile
 
+	-- These attachments define the two ends of the projectile trail.
 	local attachment0 = Instance.new("Attachment")
 	attachment0.Name = "TrailStart"
 	attachment0.Position = Vector3.new(0, 0, 0.25)
@@ -183,6 +213,8 @@ end
 
 local PROJECTILE_TEMPLATE = createProjectileTemplate()
 
+-- Creates a short-lived visual effect at the point where a projectile hits
+-- an enemy or an obstacle. Debris automatically removes the effect later.
 local function createImpactEffect(position, color)
 	local effectPart = Instance.new("Part")
 	effectPart.Name = "ProjectileImpact"
@@ -219,6 +251,9 @@ local function createImpactEffect(position, color)
 	Debris:AddItem(effectPart, 0.5)
 end
 
+-- Projectile objects are reused through a pool.
+-- This reduces cloning and destroying operations when many towers fire
+-- repeatedly during the same game.
 local Projectile = {}
 Projectile.__index = Projectile
 
@@ -230,6 +265,8 @@ function Projectile.new()
 
 	self.Visual = PROJECTILE_TEMPLATE:Clone()
 	self.Visual.Name = "PooledTowerProjectile"
+
+	-- Pooled projectiles start hidden and far below the map until acquired.
 	self.Visual.Transparency = 1
 	self.Visual.CFrame = CFrame.new(0, -1000, 0)
 	self.Visual.Parent = PROJECTILE_FOLDER
@@ -250,6 +287,7 @@ function Projectile.new()
 	return self
 end
 
+-- Takes a projectile from the pool, or creates one if the pool is empty.
 function Projectile.Acquire()
 	local projectile = table.remove(projectilePool)
 
@@ -269,6 +307,9 @@ function Projectile.Acquire()
 	return projectile
 end
 
+-- Returns a projectile to the pool after it expires or collides.
+-- If the configured pool limit has been reached, the visual is destroyed
+-- instead of being stored.
 function Projectile:Release(maximumPoolSize)
 	if not self.Active then
 		return
@@ -295,6 +336,9 @@ function Projectile:Release(maximumPoolSize)
 	end
 end
 
+-- Initializes the projectile's movement data.
+-- The initial direction uses target prediction, while later updates apply
+-- homing so the projectile can correct its path as the enemy moves.
 function Projectile:Launch(owner, origin, target, configuration)
 	self.Owner = owner
 	self.Target = target
@@ -322,6 +366,8 @@ function Projectile:Launch(owner, origin, target, configuration)
 
 	self.Velocity = direction * self.Speed
 
+	-- Raycast filtering prevents a projectile from hitting its own tower,
+	-- another projectile, or the projectile folder itself.
 	self.RaycastParameters = RaycastParams.new()
 	self.RaycastParameters.FilterType = Enum.RaycastFilterType.Exclude
 	self.RaycastParameters.IgnoreWater = true
@@ -336,6 +382,9 @@ function Projectile:Launch(owner, origin, target, configuration)
 	)
 end
 
+-- Applies damage only when the raycast hit a valid tagged enemy.
+-- The attribute can be used by other systems to identify the tower that
+-- most recently damaged the humanoid.
 function Projectile:DamageEnemy(enemy)
 	if not enemy or not CollectionService:HasTag(enemy, ENEMY_TAG) then
 		return
@@ -354,6 +403,9 @@ function Projectile:DamageEnemy(enemy)
 	humanoid:TakeDamage(self.Damage)
 end
 
+-- Updates one projectile for one Heartbeat frame.
+-- Returning false tells the main update loop that the projectile must be
+-- released back into the pool.
 function Projectile:Update(deltaTime)
 	if not self.Active then
 		return false
@@ -361,10 +413,13 @@ function Projectile:Update(deltaTime)
 
 	self.Age += deltaTime
 
+	-- Lifetime prevents lost projectiles from remaining active forever.
 	if self.Age >= self.MaximumLifetime then
 		return false
 	end
 
+	-- Homing adjusts the current velocity toward the enemy's current position.
+	-- Exponential interpolation keeps the response consistent across frame rates.
 	if self.Target and isEnemyAlive(self.Target) then
 		local _, targetRoot = getEnemyComponents(self.Target)
 
@@ -385,6 +440,8 @@ function Projectile:Update(deltaTime)
 		end
 	end
 
+	-- Gravity changes the vertical component of the velocity before moving
+	-- the projectile.
 	self.Velocity += Vector3.new(
 		0,
 		-self.Gravity * deltaTime,
@@ -393,6 +450,9 @@ function Projectile:Update(deltaTime)
 
 	local oldPosition = self.Position
 	local displacement = self.Velocity * deltaTime
+
+	-- A raycast is used instead of relying on Touched because the projectile
+	-- is anchored and may travel several studs during one frame.
 	local raycastResult = Workspace:Raycast(
 		oldPosition,
 		displacement,
@@ -422,6 +482,8 @@ function Projectile:Update(deltaTime)
 
 	self.Position = oldPosition + displacement
 
+	-- This secondary check helps the projectile hit a moving target when the
+	-- raycast passes close to the target without directly touching its parts.
 	if self.Target and isEnemyAlive(self.Target) then
 		local _, targetRoot = getEnemyComponents(self.Target)
 
@@ -443,6 +505,7 @@ function Projectile:Update(deltaTime)
 		end
 	end
 
+	-- Orient the visual in the direction in which the projectile is moving.
 	local lookDirection = self.Velocity
 
 	if lookDirection.Magnitude < 0.001 then
@@ -460,6 +523,9 @@ end
 local Tower = {}
 Tower.__index = Tower
 
+-- Creates the runtime controller for one tower model.
+-- The model must contain a BasePart named Head and may contain a Muzzle
+-- BasePart or Attachment.
 function Tower.new(model)
 	local self = setmetatable({}, Tower)
 
@@ -489,90 +555,71 @@ function Tower.new(model)
 	return self
 end
 
+-- Builds a complete configuration table from model attributes.
+-- Centralizing configuration here allows the update and projectile systems
+-- to use the same values without repeatedly reading attributes.
 function Tower:ReadConfiguration()
 	return {
-		Range = getNumberAttribute(
-			self.Model,
-			"Range",
-			DEFAULT_CONFIG.Range,
-			1
-		),
-
-		Damage = getNumberAttribute(
-			self.Model,
-			"Damage",
-			DEFAULT_CONFIG.Damage,
-			0
-		),
-
+		Range = getNumberAttribute(self.Model, "Range", DEFAULT_CONFIG.Range, 1),
+		Damage = getNumberAttribute(self.Model, "Damage", DEFAULT_CONFIG.Damage, 0),
 		FireInterval = getNumberAttribute(
 			self.Model,
 			"FireInterval",
 			DEFAULT_CONFIG.FireInterval,
 			0.05
 		),
-
 		ProjectileSpeed = getNumberAttribute(
 			self.Model,
 			"ProjectileSpeed",
 			DEFAULT_CONFIG.ProjectileSpeed,
 			1
 		),
-
 		ProjectileLifetime = getNumberAttribute(
 			self.Model,
 			"ProjectileLifetime",
 			DEFAULT_CONFIG.ProjectileLifetime,
 			0.1
 		),
-
 		ProjectileGravity = getNumberAttribute(
 			self.Model,
 			"ProjectileGravity",
 			DEFAULT_CONFIG.ProjectileGravity,
 			0
 		),
-
 		HomingStrength = getNumberAttribute(
 			self.Model,
 			"HomingStrength",
 			DEFAULT_CONFIG.HomingStrength,
 			0
 		),
-
 		RotationResponsiveness = getNumberAttribute(
 			self.Model,
 			"RotationResponsiveness",
 			DEFAULT_CONFIG.RotationResponsiveness,
 			0
 		),
-
 		AimToleranceDegrees = getNumberAttribute(
 			self.Model,
 			"AimToleranceDegrees",
 			DEFAULT_CONFIG.AimToleranceDegrees,
 			0
 		),
-
 		TargetRefreshInterval = getNumberAttribute(
 			self.Model,
 			"TargetRefreshInterval",
 			DEFAULT_CONFIG.TargetRefreshInterval,
 			0.05
 		),
-
 		RequireLineOfSight = getBooleanAttribute(
 			self.Model,
 			"RequireLineOfSight",
 			DEFAULT_CONFIG.RequireLineOfSight
 		),
-
 		TargetMode = getStringAttribute(
 			self.Model,
 			"TargetMode",
 			DEFAULT_CONFIG.TargetMode
 		),
-
 		MaxProjectilePoolSize = getNumberAttribute(
 			self.Model,
 			"MaxProjectilePoolSize",
@@ -582,6 +629,7 @@ function Tower:ReadConfiguration()
 	}
 end
 
+-- Checks distance using squared magnitude to avoid an unnecessary square root.
 function Tower:IsTargetInRange(enemy)
 	if not isEnemyAlive(enemy) then
 		return false
@@ -598,6 +646,8 @@ function Tower:IsTargetInRange(enemy)
 	return offset:Dot(offset) <= self.Config.Range ^ 2
 end
 
+-- Uses a raycast to ensure that walls or other level geometry do not block
+-- the tower from attacking its selected enemy.
 function Tower:HasLineOfSight(enemy)
 	if not self.Config.RequireLineOfSight then
 		return true
@@ -634,9 +684,12 @@ function Tower:HasLineOfSight(enemy)
 		return true
 	end
 
+	-- The target is visible only if the first object hit belongs to the enemy.
 	return result.Instance:IsDescendantOf(enemy)
 end
 
+-- Converts the selected targeting mode into a numerical score.
+-- The enemy with the lowest score becomes the selected target.
 function Tower:GetTargetScore(enemy, distance)
 	local humanoid = getEnemyComponents(enemy)
 
@@ -663,9 +716,13 @@ function Tower:GetTargetScore(enemy, distance)
 		return distance
 	end
 
+	-- Unknown modes safely fall back to closest-target behavior.
 	return distance
 end
 
+-- Searches every tagged enemy and selects the best valid candidate.
+-- Range and line-of-sight checks are performed before calculating the score
+-- so invalid enemies are never selected.
 function Tower:FindTarget()
 	local bestEnemy = nil
 	local bestScore = math.huge
@@ -698,6 +755,10 @@ function Tower:FindTarget()
 	return bestEnemy
 end
 
+-- Calculates where the enemy is expected to be when the projectile arrives.
+-- This solves an interception problem using the enemy's current velocity and
+-- the projectile's speed, which is more accurate than aiming at the current
+-- position only.
 function Tower:GetPredictedTargetPosition(origin, enemy, projectileSpeed)
 	local _, root = getEnemyComponents(enemy)
 
@@ -709,13 +770,15 @@ function Tower:GetPredictedTargetPosition(origin, enemy, projectileSpeed)
 	local targetVelocity = root.AssemblyLinearVelocity
 
 	local a = targetVelocity:Dot(targetVelocity)
-	- projectileSpeed * projectileSpeed
+		- projectileSpeed * projectileSpeed
 
 	local b = 2 * relativePosition:Dot(targetVelocity)
 	local c = relativePosition:Dot(relativePosition)
 
 	local interceptTime = nil
 
+	-- This branch handles the case where the quadratic equation becomes
+	-- nearly linear because the coefficient "a" is close to zero.
 	if math.abs(a) < 0.001 then
 		if math.abs(b) > 0.001 then
 			local linearTime = -c / b
@@ -742,15 +805,21 @@ function Tower:GetPredictedTargetPosition(origin, enemy, projectileSpeed)
 		end
 	end
 
+	-- If no valid interception time exists, aim using the direct distance.
 	if not interceptTime then
 		interceptTime = relativePosition.Magnitude / projectileSpeed
 	end
 
+	-- Limiting prediction prevents extreme values when an enemy is very fast
+	-- or when the projectile speed is low.
 	interceptTime = math.clamp(interceptTime, 0, 2)
 
 	return root.Position + targetVelocity * interceptTime
 end
 
+-- Rotates the tower horizontally toward its current target.
+-- Exponential interpolation prevents instant snapping and keeps the rotation
+-- smooth regardless of the server frame rate.
 function Tower:RotateTowardsTarget(deltaTime)
 	if not self.Target then
 		return
@@ -789,6 +858,8 @@ function Tower:RotateTowardsTarget(deltaTime)
 	)
 end
 
+-- Verifies that the tower is facing the target within the configured angle.
+-- This prevents the tower from firing backward while it is still rotating.
 function Tower:IsAimedAtTarget()
 	if not self.Target then
 		return false
@@ -830,6 +901,9 @@ function Tower:IsAimedAtTarget()
 	return alignment >= minimumAlignment
 end
 
+-- Creates and launches a projectile from the tower muzzle.
+-- The projectile is added to activeProjectiles so the Heartbeat loop can
+-- update its position and collision every frame.
 function Tower:Fire()
 	if not self.Target or not isEnemyAlive(self.Target) then
 		return
@@ -839,6 +913,7 @@ function Tower:Fire()
 	local muzzlePosition = getWorldPosition(self.Muzzle)
 
 	projectile.Visual.CFrame = getWorldCFrame(self.Muzzle)
+
 	projectile:Launch(
 		self,
 		muzzlePosition,
@@ -849,6 +924,11 @@ function Tower:Fire()
 	table.insert(activeProjectiles, projectile)
 end
 
+-- Main per-tower update:
+-- 1. Decrease cooldowns.
+-- 2. Refresh or invalidate the target.
+-- 3. Rotate toward the target.
+-- 4. Fire only when cooldown, aim, and visibility checks succeed.
 function Tower:Update(deltaTime)
 	if self.Destroyed or not self.Model.Parent then
 		return
@@ -898,6 +978,8 @@ function Tower:Update(deltaTime)
 	self.FireCooldown = self.Config.FireInterval
 end
 
+-- Marks the tower as inactive. The manager removes it from activeTowers
+-- when its CollectionService tag is removed or its model is destroyed.
 function Tower:Destroy()
 	self.Destroyed = true
 	self.Target = nil
@@ -905,6 +987,8 @@ end
 
 local activeTowers = {}
 
+-- Registers a tagged model as a tower only once.
+-- pcall prevents one invalid tower from stopping the complete tower system.
 local function registerTower(instance)
 	if not instance:IsA("Model") then
 		warn("Tower tag can only be used on Models:", instance:GetFullName())
@@ -925,6 +1009,7 @@ local function registerTower(instance)
 	activeTowers[instance] = towerOrError
 end
 
+-- Stops updating a tower after its tag is removed.
 local function unregisterTower(instance)
 	local tower = activeTowers[instance]
 
@@ -936,10 +1021,12 @@ local function unregisterTower(instance)
 	activeTowers[instance] = nil
 end
 
+-- Register towers that already exist before this script starts.
 for _, towerModel in CollectionService:GetTagged(TOWER_TAG) do
 	registerTower(towerModel)
 end
 
+-- Automatically register and unregister towers added or removed later.
 CollectionService:GetInstanceAddedSignal(TOWER_TAG):Connect(
 	registerTower
 )
@@ -948,6 +1035,9 @@ CollectionService:GetInstanceRemovedSignal(TOWER_TAG):Connect(
 	unregisterTower
 )
 
+-- A single Heartbeat loop updates every tower and every projectile.
+-- Clamping deltaTime avoids extremely large movement steps after lag spikes,
+-- which improves projectile collision reliability.
 RunService.Heartbeat:Connect(function(deltaTime)
 	deltaTime = math.min(deltaTime, 0.1)
 
@@ -959,6 +1049,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
 		end
 	end
 
+	-- Iterate backwards because expired projectiles are removed from the array.
 	for index = #activeProjectiles, 1, -1 do
 		local projectile = activeProjectiles[index]
 		local stillActive = projectile:Update(deltaTime)
@@ -966,6 +1057,8 @@ RunService.Heartbeat:Connect(function(deltaTime)
 		if not stillActive then
 			local maximumPoolSize = DEFAULT_CONFIG.MaxProjectilePoolSize
 
+			-- Use the owner's pool setting when available, allowing different
+			-- towers to control their own projectile memory usage.
 			if projectile.Owner then
 				maximumPoolSize =
 					projectile.Owner.Config.MaxProjectilePoolSize
@@ -977,6 +1070,9 @@ RunService.Heartbeat:Connect(function(deltaTime)
 	end
 end)
 
+-- Clean up all tower and projectile objects when the script is destroyed.
+-- This prevents old references, active visuals, and pooled instances from
+-- remaining in the game.
 script.Destroying:Connect(function()
 	for _, tower in activeTowers do
 		tower:Destroy()
